@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/bnb-chain/greenfield-storage-provider/base/gfspvgmgr"
 	"github.com/bnb-chain/greenfield-storage-provider/util"
 
 	"cosmossdk.io/math"
@@ -132,6 +133,7 @@ func (m *ManageModular) HandleDoneUploadObjectTask(ctx context.Context, task tas
 		metrics.ManagerTime.WithLabelValues(ManagerSuccessUpload).Observe(
 			time.Since(time.Unix(task.GetCreateTime(), 0)).Seconds())
 	}
+	log.Debugw("UploadObjectTask info", "task", task)
 	return m.pickGVGAndReplicate(ctx, task.GetVirtualGroupFamilyId(), task)
 }
 
@@ -359,6 +361,17 @@ func (m *ManageModular) HandleReplicatePieceTask(ctx context.Context, task task.
 
 func (m *ManageModular) handleFailedReplicatePieceTask(ctx context.Context, handleTask task.ReplicatePieceTask) error {
 	if handleTask.GetNotAvailableSpIdx() != -1 {
+		objectInfo, queryErr := m.baseApp.Consensus().QueryObjectInfoByID(ctx, util.Uint64ToString(handleTask.GetObjectInfo().Id.Uint64()))
+		if queryErr != nil {
+			log.Errorw("failed to query object info", "object", handleTask.GetObjectInfo(), "error", queryErr)
+			return queryErr
+		}
+		if objectInfo.GetObjectStatus() == storagetypes.OBJECT_STATUS_SEALED {
+			log.CtxInfow(ctx, "object already sealed, abort replicate task", "object_info", objectInfo)
+			m.replicateQueue.PopByKey(handleTask.Key())
+			return nil
+		}
+
 		gvgID := handleTask.GetGlobalVirtualGroupId()
 		gvg, err := m.baseApp.Consensus().QueryGlobalVirtualGroup(context.Background(), gvgID)
 		if err != nil {
@@ -745,15 +758,14 @@ func (m *ManageModular) PickVirtualGroupFamily(ctx context.Context, task task.Ap
 		err error
 		vgf *vgmgr.VirtualGroupFamilyMeta
 	)
-
-	if vgf, err = m.virtualGroupManager.PickVirtualGroupFamily(); err != nil {
+	if vgf, err = m.virtualGroupManager.PickVirtualGroupFamily(vgmgr.NewPickVGFByGVGFilter(m.spBlackList)); err != nil {
 		// create a new gvg, and retry pick.
 		if err = m.createGlobalVirtualGroup(0, nil); err != nil {
 			log.CtxErrorw(ctx, "failed to create global virtual group", "task_info", task.Info(), "error", err)
 			return 0, err
 		}
 		m.virtualGroupManager.ForceRefreshMeta()
-		if vgf, err = m.virtualGroupManager.PickVirtualGroupFamily(); err != nil {
+		if vgf, err = m.virtualGroupManager.PickVirtualGroupFamily(vgmgr.NewPickVGFByGVGFilter(m.spBlackList)); err != nil {
 			log.CtxErrorw(ctx, "failed to pick vgf", "task_info", task.Info(), "error", err)
 			return 0, err
 		}
@@ -809,7 +821,7 @@ func (m *ManageModular) createGlobalVirtualGroup(vgfID uint32, params *storagety
 			return err
 		}
 	}
-	gvgMeta, err := m.virtualGroupManager.GenerateGlobalVirtualGroupMeta(NewGenerateGVGSecondarySPsPolicyByPrefer(params, m.gvgPreferSPList))
+	gvgMeta, err := m.virtualGroupManager.GenerateGlobalVirtualGroupMeta(NewGenerateGVGSecondarySPsPolicyByPrefer(params, m.gvgPreferSPList), vgmgr.NewExcludeIDFilter(gfspvgmgr.NewIDSetFromList(m.spBlackList)))
 	if err != nil {
 		return err
 	}
@@ -836,14 +848,14 @@ func (m *ManageModular) pickGlobalVirtualGroup(ctx context.Context, vgfID uint32
 		gvg *vgmgr.GlobalVirtualGroupMeta
 	)
 
-	if gvg, err = m.virtualGroupManager.PickGlobalVirtualGroup(vgfID); err != nil {
+	if gvg, err = m.virtualGroupManager.PickGlobalVirtualGroup(vgfID, vgmgr.NewExcludeIDFilter(m.gvgBlackList)); err != nil {
 		// create a new gvg, and retry pick.
 		if err = m.createGlobalVirtualGroup(vgfID, param); err != nil {
 			log.CtxErrorw(ctx, "failed to create global virtual group", "vgf_id", vgfID, "error", err)
 			return gvg, err
 		}
 		m.virtualGroupManager.ForceRefreshMeta()
-		if gvg, err = m.virtualGroupManager.PickGlobalVirtualGroup(vgfID); err != nil {
+		if gvg, err = m.virtualGroupManager.PickGlobalVirtualGroup(vgfID, vgmgr.NewExcludeIDFilter(m.gvgBlackList)); err != nil {
 			log.CtxErrorw(ctx, "failed to pick gvg", "vgf_id", vgfID, "error", err)
 			return gvg, err
 		}
